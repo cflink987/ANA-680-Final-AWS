@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ app = Flask(__name__)
 MODEL: Any = None
 DEPLOY_FEATURES: List[str] = []
 BOUNDS: Dict[str, Any] = {}
+
 _ARTIFACTS_READY = False
 _ARTIFACTS_ERROR: Optional[str] = None
 
@@ -43,10 +44,6 @@ def _load_text(path: str) -> str:
 
 
 def load_artifacts() -> None:
-    """
-    Loads model + metadata from ./artifacts.
-    This is called lazily so the dyno can boot even if something is missing.
-    """
     global MODEL, DEPLOY_FEATURES, BOUNDS, _ARTIFACTS_READY, _ARTIFACTS_ERROR
 
     if _ARTIFACTS_READY:
@@ -72,9 +69,7 @@ def load_artifacts() -> None:
             MODEL = joblib.load(MODEL_PKL_PATH)
             logger.info("Loaded model: %s", MODEL_PKL_PATH)
         else:
-            raise FileNotFoundError(
-                f"Missing model file. Expected {MODEL_JOBLIB_PATH} or {MODEL_PKL_PATH}"
-            )
+            raise FileNotFoundError(f"Missing model file. Expected {MODEL_JOBLIB_PATH} or {MODEL_PKL_PATH}")
 
         if os.path.exists(THRESH_PATH):
             logger.info("high_addiction_threshold.txt: %s", _load_text(THRESH_PATH))
@@ -94,12 +89,6 @@ def _ensure_artifacts_loaded():
 
 
 def _coerce_instances(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Accepts:
-      - {"instances":[{...},{...}]}
-      - [{...},{...}]
-      - {...}
-    """
     if isinstance(payload, dict) and "instances" in payload:
         instances = payload["instances"]
     else:
@@ -107,43 +96,37 @@ def _coerce_instances(payload: Any) -> List[Dict[str, Any]]:
 
     if isinstance(instances, dict):
         return [instances]
+
     if isinstance(instances, list) and all(isinstance(x, dict) for x in instances):
         return instances
 
     raise ValueError("Payload must be a dict, list of dicts, or {'instances': [..]}.")
 
 
-def _allowed_gender_set() -> Optional[set]:
-    feat_bounds = BOUNDS.get("features") if isinstance(BOUNDS, dict) else None
-    if not isinstance(feat_bounds, dict):
-        return None
+def _get_feature_bounds() -> Dict[str, Any]:
+    if isinstance(BOUNDS, dict):
+        fb = BOUNDS.get("features", {})
+        if isinstance(fb, dict):
+            return fb
+    return {}
 
-    gb = feat_bounds.get("gender")
-    if isinstance(gb, dict) and isinstance(gb.get("allowed"), list):
-        return set(str(x).strip() for x in gb["allowed"])
+
+def _allowed_gender() -> Optional[set]:
+    fb = _get_feature_bounds()
+    g = fb.get("gender")
+    if isinstance(g, dict) and isinstance(g.get("allowed"), list):
+        return set(str(x).strip() for x in g["allowed"])
     return None
 
 
 def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """
-    Limiters:
-      - require all DEPLOY_FEATURES
-      - gender must be in allowed list if provided in input_bounds.json
-      - numeric fields must be numeric + within min/max if bounds provided
-    """
     errors: List[str] = []
     cleaned: List[Dict[str, Any]] = []
-
-    feat_bounds = BOUNDS.get("features") if isinstance(BOUNDS, dict) else {}
-    if not isinstance(feat_bounds, dict):
-        feat_bounds = {}
-
-    allowed_gender = _allowed_gender_set()
+    fb = _get_feature_bounds()
+    allowed_gender = _allowed_gender()
 
     for i, row in enumerate(instances):
-        row_errors = []
-
-        # require all keys
+        row_errors: List[str] = []
         missing = [f for f in DEPLOY_FEATURES if f not in row]
         if missing:
             row_errors.append(f"missing required fields: {missing}")
@@ -160,7 +143,6 @@ def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, 
                 out[f] = g
                 continue
 
-            # numeric
             try:
                 num = float(v)
             except Exception:
@@ -171,7 +153,7 @@ def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, 
                 row_errors.append(f"{f} is not finite")
                 continue
 
-            b = feat_bounds.get(f)
+            b = fb.get(f)
             if isinstance(b, dict) and "min" in b and "max" in b:
                 lo = float(b["min"])
                 hi = float(b["max"])
@@ -191,25 +173,36 @@ def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, 
 def _predict(df: pd.DataFrame) -> Dict[str, Any]:
     if hasattr(MODEL, "predict_proba"):
         proba = MODEL.predict_proba(df)[:, 1]
-    elif hasattr(MODEL, "decision_function"):
+        pred = (proba >= PRED_THRESHOLD).astype(int)
+        return {"probabilities": proba.tolist(), "predictions": pred.tolist(), "threshold": PRED_THRESHOLD}
+
+    if hasattr(MODEL, "decision_function"):
         scores = MODEL.decision_function(df)
         proba = 1 / (1 + np.exp(-scores))
-    else:
-        preds = MODEL.predict(df)
-        return {"predictions": [int(x) for x in preds], "threshold": PRED_THRESHOLD}
+        pred = (proba >= PRED_THRESHOLD).astype(int)
+        return {"probabilities": proba.tolist(), "predictions": pred.tolist(), "threshold": PRED_THRESHOLD}
 
-    pred = (proba >= PRED_THRESHOLD).astype(int)
-    return {
-        "probabilities": proba.tolist(),
-        "predictions": pred.tolist(),
-        "threshold": PRED_THRESHOLD,
-    }
+    preds = MODEL.predict(df)
+    return {"predictions": [int(x) for x in preds], "threshold": PRED_THRESHOLD}
+
 
 @app.get("/")
 def root():
     if _ARTIFACTS_ERROR:
         return jsonify({"status": "error", "detail": _ARTIFACTS_ERROR}), 500
-    return jsonify({"status": "ok", "service": "ana680-final"}), 200
+
+    allowed = ["Female", "Male", "Other"]
+    try:
+        gset = _allowed_gender()
+        if gset:
+            allowed = sorted(list(gset))
+    except Exception:
+        pass
+
+    try:
+        return render_template("index.html", allowed_genders=allowed)
+    except Exception:
+        return jsonify({"service": "ana680-final", "status": "ok"}), 200
 
 
 @app.get("/health")

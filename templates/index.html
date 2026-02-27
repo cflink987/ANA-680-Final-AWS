@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ANA 680 Final — Predictor</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #f7f7fb; }
+    .card { border-radius: 14px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  </style>
+</head>
+<body>
+  <div class="container py-4">
+    <div class="row justify-content-center">
+      <div class="col-lg-9">
+        <div class="mb-3">
+          <h3 class="mb-0">Final Project Predictor</h3>
+          <div class="text-muted">Enter inputs and click Predict (server validates bounds).</div>
+        </div>
+
+        <div class="card shadow-sm">
+          <div class="card-body">
+            <div id="alert" class="alert d-none" role="alert"></div>
+
+            <form id="frm" class="row g-3">
+              <div class="col-md-3">
+                <label class="form-label">Age</label>
+                <input class="form-control" type="number" step="1" name="age" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Gender</label>
+                <select class="form-select" name="gender" required>
+                  {% for g in allowed_genders %}
+                    <option value="{{ g }}">{{ g }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Daily gaming hours</label>
+                <input class="form-control" type="number" step="0.01" name="daily_gaming_hours" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Weekly sessions</label>
+                <input class="form-control" type="number" step="1" name="weekly_sessions" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Years gaming</label>
+                <input class="form-control" type="number" step="1" name="years_gaming" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Competitive rank</label>
+                <input class="form-control" type="number" step="1" name="competitive_rank" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Online friends</label>
+                <input class="form-control" type="number" step="1" name="online_friends" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Microtransactions spending</label>
+                <input class="form-control" type="number" step="0.01" name="microtransactions_spending" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Screen time total</label>
+                <input class="form-control" type="number" step="0.01" name="screen_time_total" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Sleep hours</label>
+                <input class="form-control" type="number" step="0.01" name="sleep_hours" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Stress level</label>
+                <input class="form-control" type="number" step="1" name="stress_level" required>
+              </div>
+
+              <div class="col-md-3">
+                <label class="form-label">Depression score</label>
+                <input class="form-control" type="number" step="0.01" name="depression_score" required>
+              </div>
+
+              <div class="col-12 d-flex gap-2 mt-2">
+                <button id="btn" class="btn btn-primary" type="submit">Predict</button>
+                <button class="btn btn-outline-secondary" type="button" id="fill">Fill Example</button>
+              </div>
+            </form>
+
+            <hr class="my-4">
+
+            <div>
+              <div class="fw-semibold mb-2">Result</div>
+              <pre id="out" class="p-3 bg-light border rounded mono mb-0">{}</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="text-muted mt-3 small">
+          API endpoint: <span class="mono">POST /predict</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const frm = document.getElementById("frm");
+const out = document.getElementById("out");
+const alertBox = document.getElementById("alert");
+const btn = document.getElementById("btn");
+
+function showAlert(msg, type="danger") {
+  alertBox.className = "alert alert-" + type;
+  alertBox.textContent = msg;
+  alertBox.classList.remove("d-none");
+}
+function hideAlert() { alertBox.classList.add("d-none"); }
+
+document.getElementById("fill").addEventListener("click", () => {
+  const ex = {
+    age: 35, gender: "Male", daily_gaming_hours: 4.0, weekly_sessions: 20,
+    years_gaming: 10, competitive_rank: 5, online_friends: 120,
+    microtransactions_spending: 25.0, screen_time_total: 7.5,
+    sleep_hours: 6.5, stress_level: 6, depression_score: 4.2
+  };
+  for (const [k,v] of Object.entries(ex)) frm.elements[k].value = v;
+});
+
+frm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  hideAlert();
+  btn.disabled = true;
+  btn.textContent = "Predicting...";
+
+  try {
+    const payload = { instances: [ Object.fromEntries(new FormData(frm)) ] };
+
+    // Convert numeric fields from strings to numbers (gender stays string)
+    for (const k of Object.keys(payload.instances[0])) {
+      if (k !== "gender") payload.instances[0][k] = Number(payload.instances[0][k]);
+    }
+
+    const r = await fetch("/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await r.json();
+    out.textContent = JSON.stringify(data, null, 2);
+
+    if (!r.ok) {
+      showAlert(data.error || "Request failed", "danger");
+    } else {
+      showAlert("Prediction succeeded ✔️", "success");
+    }
+  } catch (err) {
+    showAlert(String(err), "danger");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Predict";
+  }
+});
+</script>
+</body>
+</html>
