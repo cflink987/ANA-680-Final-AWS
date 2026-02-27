@@ -1,0 +1,18 @@
+{
+  "instances": [
+    {
+      "age": 25,
+      "gender": "Male",
+      "daily_gaming_hours": 2,
+      "weekly_sessions": 10,
+      "years_gaming": 5,
+      "competitive_rank": 50,
+      "online_friends": 30,
+      "microtransactions_spending": 20,
+      "screen_time_total": 6,
+      "sleep_hours": 7,
+      "stress_level": 4,
+      "depression_score": 2
+    }
+  ]
+}
