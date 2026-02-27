@@ -1,0 +1,55 @@
+{
+  "features": {
+    "gender": {
+      "allowed": [
+        "Female",
+        "Male",
+        "Other"
+      ]
+    },
+    "age": {
+      "min": 13.0,
+      "max": 59.0
+    },
+    "daily_gaming_hours": {
+      "min": 0.0,
+      "max": 26.81
+    },
+    "weekly_sessions": {
+      "min": 1.0,
+      "max": 39.0
+    },
+    "years_gaming": {
+      "min": 0.0,
+      "max": 24.0
+    },
+    "competitive_rank": {
+      "min": 0.0,
+      "max": 99.0
+    },
+    "online_friends": {
+      "min": 0.0,
+      "max": 499.0
+    },
+    "microtransactions_spending": {
+      "min": 0.0,
+      "max": 5588.2
+    },
+    "screen_time_total": {
+      "min": 0.21,
+      "max": 42.68
+    },
+    "sleep_hours": {
+      "min": 0.27,
+      "max": 13.99
+    },
+    "stress_level": {
+      "min": 1.0,
+      "max": 10.0
+    },
+    "depression_score": {
+      "min": 0.0,
+      "max": 10.0
+    }
+  }
+}

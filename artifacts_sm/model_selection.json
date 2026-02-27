@@ -1,0 +1,6 @@
+{
+  "selected_model": "logistic_regression",
+  "pipeline": true,
+  "decision_threshold": 0.5,
+  "target_definition": "high_addiction = 1 if addiction_level >= quantile(0.8) else 0"
+}
