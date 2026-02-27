@@ -1,14 +1,18 @@
 import json
+import logging
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
 
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ARTIFACT_DIR = os.path.join(APP_DIR, "artifacts")
+ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", os.path.join(APP_DIR, "artifacts"))
 
 FEATURES_PATH = os.path.join(ARTIFACT_DIR, "deploy_features.json")
 BOUNDS_PATH = os.path.join(ARTIFACT_DIR, "input_bounds.json")
@@ -17,13 +21,15 @@ THRESH_PATH = os.path.join(ARTIFACT_DIR, "high_addiction_threshold.txt")
 MODEL_JOBLIB_PATH = os.path.join(ARTIFACT_DIR, "model.joblib")
 MODEL_PKL_PATH = os.path.join(ARTIFACT_DIR, "deploy_model.pkl")
 
-PRED_THRESHOLD = 0.50
+PRED_THRESHOLD = float(os.environ.get("PRED_THRESHOLD", "0.5"))
 
 app = Flask(__name__)
 
-MODEL = None
+MODEL: Any = None
 DEPLOY_FEATURES: List[str] = []
 BOUNDS: Dict[str, Any] = {}
+_ARTIFACTS_READY = False
+_ARTIFACTS_ERROR: Optional[str] = None
 
 
 def _load_json(path: str) -> Any:
@@ -37,26 +43,54 @@ def _load_text(path: str) -> str:
 
 
 def load_artifacts() -> None:
-    global MODEL, DEPLOY_FEATURES, BOUNDS
+    """
+    Loads model + metadata from ./artifacts.
+    This is called lazily so the dyno can boot even if something is missing.
+    """
+    global MODEL, DEPLOY_FEATURES, BOUNDS, _ARTIFACTS_READY, _ARTIFACTS_ERROR
 
-    if not os.path.exists(FEATURES_PATH):
-        raise FileNotFoundError(f"Missing {FEATURES_PATH}")
-    DEPLOY_FEATURES = _load_json(FEATURES_PATH)
-
-    if os.path.exists(BOUNDS_PATH):
-        BOUNDS = _load_json(BOUNDS_PATH)
-    else:
-        BOUNDS = {}
-
-    if os.path.exists(MODEL_JOBLIB_PATH):
-        MODEL = joblib.load(MODEL_JOBLIB_PATH)
+    if _ARTIFACTS_READY:
         return
 
-    if os.path.exists(MODEL_PKL_PATH):
-        MODEL = joblib.load(MODEL_PKL_PATH)
-        return
+    try:
+        if not os.path.exists(FEATURES_PATH):
+            raise FileNotFoundError(f"Missing {FEATURES_PATH}")
 
-    raise FileNotFoundError(f"Missing model file. Expected {MODEL_JOBLIB_PATH} or {MODEL_PKL_PATH}")
+        DEPLOY_FEATURES = _load_json(FEATURES_PATH)
+        if not isinstance(DEPLOY_FEATURES, list) or not all(isinstance(x, str) for x in DEPLOY_FEATURES):
+            raise ValueError("deploy_features.json must be a JSON list of strings")
+
+        if os.path.exists(BOUNDS_PATH):
+            BOUNDS = _load_json(BOUNDS_PATH)
+        else:
+            BOUNDS = {}
+
+        if os.path.exists(MODEL_JOBLIB_PATH):
+            MODEL = joblib.load(MODEL_JOBLIB_PATH)
+            logger.info("Loaded model: %s", MODEL_JOBLIB_PATH)
+        elif os.path.exists(MODEL_PKL_PATH):
+            MODEL = joblib.load(MODEL_PKL_PATH)
+            logger.info("Loaded model: %s", MODEL_PKL_PATH)
+        else:
+            raise FileNotFoundError(
+                f"Missing model file. Expected {MODEL_JOBLIB_PATH} or {MODEL_PKL_PATH}"
+            )
+
+        if os.path.exists(THRESH_PATH):
+            logger.info("high_addiction_threshold.txt: %s", _load_text(THRESH_PATH))
+
+        _ARTIFACTS_READY = True
+        _ARTIFACTS_ERROR = None
+
+    except Exception as e:
+        _ARTIFACTS_ERROR = str(e)
+        logger.exception("Artifact load failed: %s", _ARTIFACTS_ERROR)
+
+
+@app.before_request
+def _ensure_artifacts_loaded():
+    if not _ARTIFACTS_READY and _ARTIFACTS_ERROR is None:
+        load_artifacts()
 
 
 def _coerce_instances(payload: Any) -> List[Dict[str, Any]]:
@@ -79,58 +113,62 @@ def _coerce_instances(payload: Any) -> List[Dict[str, Any]]:
     raise ValueError("Payload must be a dict, list of dicts, or {'instances': [..]}.")
 
 
-def _normalize_gender(val: Any) -> str:
-    if val is None:
-        return ""
-    s = str(val).strip()
-    return s
+def _allowed_gender_set() -> Optional[set]:
+    feat_bounds = BOUNDS.get("features") if isinstance(BOUNDS, dict) else None
+    if not isinstance(feat_bounds, dict):
+        return None
+
+    gb = feat_bounds.get("gender")
+    if isinstance(gb, dict) and isinstance(gb.get("allowed"), list):
+        return set(str(x).strip() for x in gb["allowed"])
+    return None
 
 
 def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    Implements the same “limiters” concept from your notebook:
-    - required feature presence
-    - numeric min/max bounds from input_bounds.json
-    - allowed gender values from input_bounds.json
+    Limiters:
+      - require all DEPLOY_FEATURES
+      - gender must be in allowed list if provided in input_bounds.json
+      - numeric fields must be numeric + within min/max if bounds provided
     """
     errors: List[str] = []
-    out_rows: List[Dict[str, Any]] = []
+    cleaned: List[Dict[str, Any]] = []
 
-    feat_bounds = (BOUNDS.get("features") or {}) if isinstance(BOUNDS, dict) else {}
+    feat_bounds = BOUNDS.get("features") if isinstance(BOUNDS, dict) else {}
+    if not isinstance(feat_bounds, dict):
+        feat_bounds = {}
 
-    allowed_gender = None
-    if "gender" in feat_bounds and isinstance(feat_bounds["gender"], dict):
-        allowed_gender = feat_bounds["gender"].get("allowed")
-        if isinstance(allowed_gender, list):
-            allowed_gender = set(str(x) for x in allowed_gender)
+    allowed_gender = _allowed_gender_set()
 
     for i, row in enumerate(instances):
-        # required fields
+        row_errors = []
+
+        # require all keys
         missing = [f for f in DEPLOY_FEATURES if f not in row]
         if missing:
-            errors.append(f"row[{i}] missing required fields: {missing}")
-            continue
+            row_errors.append(f"missing required fields: {missing}")
 
-        clean: Dict[str, Any] = {}
+        out: Dict[str, Any] = {}
 
         for f in DEPLOY_FEATURES:
-            v = row.get(f)
+            v = row.get(f, None)
 
             if f == "gender":
-                g = _normalize_gender(v)
+                g = "" if v is None else str(v).strip()
                 if allowed_gender is not None and g not in allowed_gender:
-                    errors.append(f"row[{i}].gender='{g}' not in allowed={sorted(list(allowed_gender))}")
-                clean[f] = g
+                    row_errors.append(f"gender='{g}' not in allowed={sorted(list(allowed_gender))}")
+                out[f] = g
                 continue
 
+            # numeric
             try:
                 num = float(v)
             except Exception:
-                errors.append(f"row[{i}].{f}='{v}' is not numeric")
+                row_errors.append(f"{f}='{v}' is not numeric")
                 continue
 
             if not np.isfinite(num):
-                errors.append(f"row[{i}].{f} is not finite")
+                row_errors.append(f"{f} is not finite")
                 continue
 
             b = feat_bounds.get(f)
@@ -138,31 +176,54 @@ def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, 
                 lo = float(b["min"])
                 hi = float(b["max"])
                 if num < lo or num > hi:
-                    errors.append(f"row[{i}].{f}={num} outside [{lo}, {hi}]")
-            clean[f] = num
+                    row_errors.append(f"{f}={num} outside [{lo}, {hi}]")
 
-        out_rows.append(clean)
+            out[f] = num
 
-    return out_rows, errors
+        if row_errors:
+            errors.append(f"row[{i}] " + "; ".join(row_errors))
+        else:
+            cleaned.append(out)
+
+    return cleaned, errors
 
 
-@app.before_first_request
-def _startup():
-    load_artifacts()
+def _predict(df: pd.DataFrame) -> Dict[str, Any]:
+    if hasattr(MODEL, "predict_proba"):
+        proba = MODEL.predict_proba(df)[:, 1]
+    elif hasattr(MODEL, "decision_function"):
+        scores = MODEL.decision_function(df)
+        proba = 1 / (1 + np.exp(-scores))
+    else:
+        preds = MODEL.predict(df)
+        return {"predictions": [int(x) for x in preds], "threshold": PRED_THRESHOLD}
 
+    pred = (proba >= PRED_THRESHOLD).astype(int)
+    return {
+        "probabilities": proba.tolist(),
+        "predictions": pred.tolist(),
+        "threshold": PRED_THRESHOLD,
+    }
 
 @app.get("/")
 def root():
-    return jsonify({"status": "ok", "service": "final-project"})
+    if _ARTIFACTS_ERROR:
+        return jsonify({"status": "error", "detail": _ARTIFACTS_ERROR}), 500
+    return jsonify({"status": "ok", "service": "ana680-final"}), 200
 
 
 @app.get("/health")
 def health():
+    if _ARTIFACTS_ERROR:
+        return jsonify({"status": "error", "detail": _ARTIFACTS_ERROR}), 500
     return jsonify({"status": "ok"}), 200
 
 
 @app.post("/predict")
 def predict():
+    if _ARTIFACTS_ERROR:
+        return jsonify({"error": "Artifacts not loaded", "detail": _ARTIFACTS_ERROR}), 500
+
     try:
         payload = request.get_json(force=True)
         instances = _coerce_instances(payload)
@@ -172,20 +233,14 @@ def predict():
             return jsonify({"error": "Input validation failed", "details": errors}), 400
 
         df = pd.DataFrame(clean_rows, columns=DEPLOY_FEATURES)
+        out = _predict(df)
+        return jsonify(out), 200
 
-        proba = MODEL.predict_proba(df)[:, 1]
-        pred = (proba >= PRED_THRESHOLD).astype(int)
-
-        return jsonify(
-            {
-                "probabilities": proba.tolist(),
-                "predictions": pred.tolist(),
-                "threshold": PRED_THRESHOLD,
-            }
-        )
     except Exception as e:
+        logger.exception("Prediction error: %s", str(e))
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
