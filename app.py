@@ -48,7 +48,6 @@ def load_artifacts() -> None:
     else:
         BOUNDS = {}
 
-    # Load model
     if os.path.exists(MODEL_JOBLIB_PATH):
         MODEL = joblib.load(MODEL_JOBLIB_PATH)
         return
@@ -117,7 +116,6 @@ def validate_instances(instances: List[Dict[str, Any]]) -> Tuple[List[Dict[str, 
         for f in DEPLOY_FEATURES:
             v = row.get(f)
 
-            # gender validation
             if f == "gender":
                 g = _normalize_gender(v)
                 if allowed_gender is not None and g not in allowed_gender:
